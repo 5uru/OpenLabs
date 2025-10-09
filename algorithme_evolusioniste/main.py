@@ -3,10 +3,8 @@ import jax.numpy as jnp
 from jax import random
 import string
 
-# -----------------------------
-# Configuration
-# -----------------------------
-TARGET = "Jonathan Suru"  # ← Remplacez par votre nom
+
+TARGET = "Jonathan Suru"
 POP_SIZE = 200          # Taille de la population
 MUTATION_RATE = 0.05    # Probabilité de mutation par caractère
 SEED = 42
@@ -21,9 +19,7 @@ CHARSET = string.ascii_letters + string.digits + " .,-_"
 CHARSET_ARRAY = jnp.array([ord(c) for c in CHARSET])
 CHARSET_SIZE = len(CHARSET_ARRAY)
 
-# -----------------------------
-# Fonctions de l'algorithme
-# -----------------------------
+
 
 def create_random_genome(key):
     """Crée un génome aléatoire (tableau d'entiers ASCII)."""
@@ -63,9 +59,7 @@ def decode_genome(genome):
     """Convertit un génome (entiers) en chaîne de caractères."""
     return ''.join(chr(int(x)) for x in genome)
 
-# -----------------------------
-# Boucle principale
-# -----------------------------
+
 
 def main():
     key = random.PRNGKey(SEED)
