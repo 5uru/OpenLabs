@@ -5,39 +5,41 @@ import numpy as np
 class Discriminator(nnx.Module):
     def __init__(self, rngs=nnx.Rngs(0)):
 
-        self.linear1 = nnx.Linear(2352, 1024, rngs=rngs)
-        self.dropout1 = nnx.Dropout(0.3, rngs=rngs)
+        self.conv1 = nnx.Conv(in_features=3, out_features=64, kernel_size=(3,3),
+                                padding='SAME', rngs=rngs)
 
-        self.linear2 = nnx.Linear(1024, 512, rngs=rngs)
-        self.dropout2 = nnx.Dropout(0.3, rngs=rngs)
+        self.conv2 = nnx.Conv(in_features=64, out_features=128, kernel_size=(3,3), strides=(2,2),
+                                padding='SAME', rngs=rngs)
 
-        self.linear3 = nnx.Linear(512, 256, rngs=rngs)
-        self.dropout3 = nnx.Dropout(0.3, rngs=rngs)
 
-        self.linear4 = nnx.Linear(256, 1, rngs=rngs)
+        self.conv3 = nnx.Conv(in_features=128, out_features=128, kernel_size=(3,3), strides=(2,2),
+                                padding='SAME', rngs=rngs)
+        self.conv4 = nnx.Conv(in_features=128, out_features=256, kernel_size=(3,3), strides=(2,2),
+                              padding='SAME', rngs=rngs)
+
+        self.dropout = nnx.Dropout(0.3, rngs=rngs)
+        self.linear = nnx.Linear(4096, 1, rngs=rngs)
 
 
     def __call__(self, x, deterministic=False):
-        # We transform the input of (batch_size, 28, 2, 3) to (batch_size, 2352)
-        x = x.reshape(x.shape[0], 2352)
 
-        x = self.linear1(x)
-        x = nnx.relu(x)
-        x = self.dropout1(x, deterministic=deterministic)
+        x = self.conv1(x)
+        x = nnx.leaky_relu(x, 0.2)
 
-        x = self.linear2(x)
-        x = nnx.relu(x)
-        x = self.dropout2(x, deterministic=deterministic)
+        x = self.conv2(x)
+        x = nnx.leaky_relu(x, 0.2)
 
-        x = self.linear3(x)
-        x = nnx.relu(x)
-        x = self.dropout3(x, deterministic=deterministic)
+        x = self.conv3(x)
+        x = nnx.leaky_relu(x, 0.2)
 
-        x = self.linear4(x)
+        x = self.conv4(x)
+        x = nnx.leaky_relu(x, 0.2)
 
-        x = nnx.sigmoid(x)
+        x = x.reshape((x.shape[0], -1))  # Flatten
+        x = self.dropout(x, deterministic=deterministic)
+        x = self.linear(x)
 
-        return x
+        return nnx.sigmoid(x)
 
 if __name__ == "__main__":
     key = jax.random.PRNGKey(0)
