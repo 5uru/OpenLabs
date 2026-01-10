@@ -1,62 +1,56 @@
+from typing import cast
+
+import huggingface_hub.constants
 import numpy as np
-import PIL as pil
-from sentence_transformers import SentenceTransformer
+from sqlalchemy import Column, Integer, String, create_engine
+from sqlalchemy.orm import declarative_base, sessionmaker
 from uform import Modality, get_model
 from usearch.index import Index
 
+if not hasattr(huggingface_hub.constants, "HF_HUB_ENABLE_HF_TRANSFER"):
+    setattr(huggingface_hub.constants, "HF_HUB_ENABLE_HF_TRANSFER", False)
+
 processors, models = get_model("unum-cloud/uform3-image-text-english-small")
+model_text = models[Modality.TEXT_ENCODER]
+processor_text = processors[Modality.TEXT_ENCODER]
+
+Base = declarative_base()
 
 
-# 1. Initialize the Embedding Model
-# This converts text to vectors (embeddings)
-model = SentenceTransformer("all-MiniLM-L6-v2")
-
-# 2. Your Original Data (The Text)
-documents = [
-    "USearch is a high-performance vector search engine.",
-    "Python is a popular programming language.",
-    "The quick brown fox jumps over the lazy dog.",
-    "Vector databases are essential for AI applications.",
-]
-
-# 3. Create a Lookup Table (Map)
-# This is crucial! We map a unique ID (integer) to the text.
-# In a real app, this would likely be a Database ID (SQL/NoSQL).
-id_to_text = {i: text for i, text in enumerate(documents)}
-
-print(f"Lookup Table: {id_to_text}")
-# Output: {0: 'USearch is...', 1: 'Python is...', ...}
+class MyTable(Base):
+    __tablename__ = "my_table"
+    id = Column(Integer, primary_key=True)
+    text = Column(String)
 
 
-# 4. Generate Embeddings
-vectors = model.encode(documents)
+# Create engine and tables
+engine = create_engine("sqlite:///mydatabase.db")
+Base.metadata.create_all(engine)
 
-# 5. Initialize and Populate USearch Index
-# We use the same keys (0, 1, 2, 3) as our lookup table
-index = Index(ndim=384, metric="cos", dtype="f16")
-keys = np.array(list(id_to_text.keys()))
-index.add(keys, vectors)
+# Create a session
+Session = sessionmaker(bind=engine)
+session = Session()
 
 
-# 6. Perform a Search
-query_text = "I need a fast search engine"
-query_vector = model.encode([query_text])[0]
+index = Index(ndim=256)
 
-# Search for the top 2 most similar vectors
-matches = index.search(query_vector, 2)
 
-print(f"\n--- Search Results for: '{query_text}' ---")
+class VectorDB:
+    def __init__(self):
+        self.session = session
 
-# 7. Retrieve the Original Text
-for match in matches:
-    # match.key is the ID we stored earlier
-    doc_id = match.key
-    distance = match.distance
+    def add_entry(self, text, text_embedding):
+        new_entry = MyTable(text=text)
+        self.session.add(new_entry)
+        self.session.commit()
 
-    # USE THE ID TO GET THE TEXT FROM OUR LOOKUP TABLE
-    original_text = id_to_text[doc_id]
+        text_data = processor_text(text_embedding)
+        text_embedding = model_text.encode(text_data, return_features=False)
+        index.add(cast(int, new_entry.id), text_embedding.flatten(), copy=True)
 
-    print(f"ID: {doc_id}")
-    print(f"Text: {original_text}")
-    print(f"Distance: {distance:.4f}")
-    print("-" * 30)
+    def get_entry(self, query, top_k=10):
+        tokens = processor_text(query)
+        vector = model_text.encode(tokens, return_features=False)
+        matches = index.search(vector.flatten(), top_k)
+        matches_ids = [int(id) for id in matches.keys]
+        return [self.session.query(MyTable).get(id).text for id in matches_ids]
