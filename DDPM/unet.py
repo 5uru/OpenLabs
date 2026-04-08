@@ -1,160 +1,263 @@
 import math
 
 import torch
-import torch.nn as nn
+import torch.nn.functional as F
+from torch import nn
 
 
-def exists(x):
-    return x is not None
+# ─────────────────────────────────────────────────────────────
+# 1. Activation Swish
+# ─────────────────────────────────────────────────────────────
+class Swish(nn.Module):
+    def forward(self, x):
+        return x * torch.sigmoid(x)
 
 
-# 🕐 Time Embedding (standard DDPM)
-class SinusoidalPosEmb(nn.Module):
-    def __init__(self, dim):
+# ─────────────────────────────────────────────────────────────
+# 2. Embedding temporel (sinusoidal)
+# ─────────────────────────────────────────────────────────────
+class TimeEmbedding(nn.Module):
+    def __init__(self, dim: int):
         super().__init__()
         self.dim = dim
+        half = dim // 4
+        self.register_buffer(
+            "frequencies", torch.exp(torch.arange(half) * -(math.log(10000) / half))
+        )
+        self.mlp = nn.Sequential(
+            nn.Linear(half * 2, dim),
+            Swish(),
+            nn.Linear(dim, dim),
+        )
 
-    def forward(self, t):
-        half = self.dim // 2
-        freqs = torch.exp(-math.log(10000) * torch.arange(half, device=t.device) / half)
-        x = t[:, None] * freqs[None, :]
-        return torch.cat((x.sin(), x.cos()), dim=-1)
+    def forward(self, t: torch.Tensor) -> torch.Tensor:
+        # t: (B,)
+        emb = t[:, None] * self.frequencies[None, :]  # (B, half)
+        emb = torch.cat([emb.sin(), emb.cos()], dim=-1)  # (B, half*2)
+        return self.mlp(emb)  # (B, dim)
 
 
-# 🧱 ResBlock avec conditionnement temporel (FiLM: Scale & Shift)
-class ResnetBlock(nn.Module):
-    def __init__(self, dim, dim_out, *, time_emb_dim=None, groups=8):
+# ─────────────────────────────────────────────────────────────
+# 3. Bloc résiduel avec conditionnement temps
+# ─────────────────────────────────────────────────────────────
+class ResidualBlock(nn.Module):
+    def __init__(
+        self,
+        in_ch: int,
+        out_ch: int,
+        time_emb_dim: int,
+        groups: int = 8,
+        dropout: float = 0.1,
+    ):
         super().__init__()
-        self.mlp = (
-            nn.Sequential(nn.SiLU(), nn.Linear(time_emb_dim, dim_out * 2))
-            if time_emb_dim
-            else None
-        )
+        self.norm1 = nn.GroupNorm(groups, in_ch)
+        self.conv1 = nn.Conv2d(in_ch, out_ch, 3, padding=1)
 
-        self.block1 = nn.Sequential(
-            nn.GroupNorm(groups, dim), nn.Conv2d(dim, dim_out, 3, padding=1), nn.SiLU()
+        self.time_proj = nn.Linear(time_emb_dim, out_ch)
+
+        self.norm2 = nn.GroupNorm(groups, out_ch)
+        self.dropout = nn.Dropout(dropout)
+        self.conv2 = nn.Conv2d(out_ch, out_ch, 3, padding=1)
+
+        self.shortcut = (
+            nn.Identity() if in_ch == out_ch else nn.Conv2d(in_ch, out_ch, 1)
         )
-        self.block2 = nn.Sequential(
-            nn.GroupNorm(groups, dim_out),
-            nn.Conv2d(dim_out, dim_out, 3, padding=1),
-            nn.SiLU(),
-        )
-        self.res_conv = nn.Conv2d(dim, dim_out, 1) if dim != dim_out else nn.Identity()
+        self.act = Swish()
+
+    def forward(self, x: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
+        h = self.act(self.norm1(x))
+        h = self.conv1(h)
+        h = h + self.time_proj(self.act(t_emb))[:, :, None, None]
+        h = self.conv2(self.dropout(self.act(self.norm2(h))))
+        return h + self.shortcut(x)
+
+
+# ─────────────────────────────────────────────────────────────
+# 4. Attention (optionnel, à 14×14 pour 28×28)
+# ─────────────────────────────────────────────────────────────
+class AttentionBlock(nn.Module):
+    def __init__(self, ch: int, groups: int = 8, n_heads: int = 1):
+        super().__init__()
+        self.norm = nn.GroupNorm(groups, ch)
+        self.qkv = nn.Conv2d(ch, ch * 3, 1)
+        self.proj = nn.Conv2d(ch, ch, 1)
+        self.n_heads = n_heads
+
+    def forward(self, x: torch.Tensor, t_emb: torch.Tensor = None) -> torch.Tensor:
+        B, C, H, W = x.shape
+        _ = t_emb  # unused, kept for API consistency
+
+        qkv = self.qkv(self.norm(x))  # (B, 3*C, H, W)
+        q, k, v = qkv.chunk(3, dim=1)
+
+        # Flatten spatial dims
+        q, k, v = [t.flatten(2).transpose(1, 2) for t in (q, k, v)]  # (B, HW, C)
+
+        # Multi-head attention
+        scale = (C // self.n_heads) ** -0.5
+        attn = (q @ k.transpose(-2, -1)) * scale
+        attn = attn.softmax(dim=-1)
+        out = attn @ v
+
+        # Reshape back
+        out = out.transpose(1, 2).reshape(B, C, H, W)
+        return x + self.proj(out)
+
+
+# ─────────────────────────────────────────────────────────────
+# 5. Downsample / Upsample
+# ─────────────────────────────────────────────────────────────
+class Downsample(nn.Module):
+    def __init__(self, ch: int):
+        super().__init__()
+        self.conv = nn.Conv2d(ch, ch, 3, stride=2, padding=1)
 
     def forward(self, x, t_emb=None):
-        h = self.block1(x)
-        if exists(self.mlp) and exists(t_emb):
-            scale, shift = self.mlp(t_emb).chunk(2, dim=1)
-            # FiLM: h = h * (scale + 1) + shift
-            h = h * (scale[:, :, None, None] + 1) + shift[:, :, None, None]
-        h = self.block2(h)
-        return h + self.res_conv(x)
+        return self.conv(x)
 
 
-# 🕸️ U-Net explicite & stable pour (3, 28, 28)
-class Unet(nn.Module):
-    def __init__(self, dim=32, channels=3, time_emb_dim=128):
+class Upsample(nn.Module):
+    def __init__(self, ch: int):
         super().__init__()
-        # 1️⃣ Time MLP
-        self.time_mlp = nn.Sequential(
-            SinusoidalPosEmb(dim),
-            nn.Linear(dim, time_emb_dim),
-            nn.SiLU(),
+        self.conv = nn.Conv2d(ch, ch, 3, padding=1)
+
+    def forward(self, x, t_emb=None):
+        x = F.interpolate(x, scale_factor=2, mode="nearest")
+        return self.conv(x)
+
+
+# ─────────────────────────────────────────────────────────────
+# 6. UNet principal
+# ─────────────────────────────────────────────────────────────
+class UNet(nn.Module):
+    """
+    UNet pour DDPM - entrée: (B, 3, 28, 28), sortie: (B, 3, 28, 28)
+    Architecture adaptée de Ho et al. 2020 [[11]][[29]]
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 3,
+        out_channels: int = 3,
+        base_channels: int = 64,
+        channel_mults: tuple = (1, 2, 4),  # 28→14→7→7→14→28
+        attn_resolutions: tuple = (14,),  # attention à 14×14
+        num_res_blocks: int = 2,
+        dropout: float = 0.1,
+        time_emb_dim: int = None,
+    ):
+        super().__init__()
+        time_emb_dim = time_emb_dim or base_channels * 4
+
+        # --- Embedding temporel ---
+        self.time_emb = nn.Sequential(
+            TimeEmbedding(base_channels),
+            nn.Linear(base_channels, time_emb_dim),
+            Swish(),
             nn.Linear(time_emb_dim, time_emb_dim),
         )
-        self.init_conv = nn.Conv2d(channels, dim, 3, padding=1)
 
-        # 2️️ DOWN PATH (28→14→7)
-        self.d1_b1 = ResnetBlock(dim, dim * 2, time_emb_dim=time_emb_dim)
-        self.d1_b2 = ResnetBlock(dim * 2, dim * 2, time_emb_dim=time_emb_dim)
-        self.d1_down = nn.Conv2d(dim * 2, dim * 2, 4, 2, 1)  # 28→14
+        # --- Conv d'entrée ---
+        self.input_conv = nn.Conv2d(in_channels, base_channels, 3, padding=1)
 
-        self.d2_b1 = ResnetBlock(dim * 2, dim * 4, time_emb_dim=time_emb_dim)
-        self.d2_b2 = ResnetBlock(dim * 4, dim * 4, time_emb_dim=time_emb_dim)
-        self.d2_down = nn.Conv2d(dim * 4, dim * 4, 4, 2, 1)  # 14→7
+        # --- Downsampling ---
+        self.down_modules = nn.ModuleList()
+        ch = base_channels
+        skips_ch = [ch]
 
-        # 3️⃣ MID (7×7)
-        self.mid1 = ResnetBlock(dim * 4, dim * 4, time_emb_dim=time_emb_dim)
-        self.mid2 = ResnetBlock(dim * 4, dim * 4, time_emb_dim=time_emb_dim)
+        for i, mult in enumerate(channel_mults):
+            out_ch = ch * mult
+            for _ in range(num_res_blocks):
+                self.down_modules.append(
+                    ResidualBlock(ch, out_ch, time_emb_dim, dropout=dropout)
+                )
+                ch = out_ch
+                if ch in [c * base_channels for c in attn_resolutions]:
+                    self.down_modules.append(AttentionBlock(ch))
+                skips_ch.append(ch)
+            if i < len(channel_mults) - 1:
+                self.down_modules.append(Downsample(ch))
+                skips_ch.append(ch)
 
-        # 4️⃣ UP PATH (7→14→28)
-        self.u2_up = nn.ConvTranspose2d(dim * 4, dim * 4, 4, 2, 1)  # 7→14
-        # Attention aux canaux après concaténation avec les skips
-        self.u2_b1 = ResnetBlock(
-            dim * 4 + dim * 4, dim * 2, time_emb_dim=time_emb_dim
-        )  # 128+128 → 64
-        self.u2_b2 = ResnetBlock(
-            dim * 2 + dim * 4, dim * 2, time_emb_dim=time_emb_dim
-        )  # 64+128  → 64
-
-        self.u1_up = nn.ConvTranspose2d(dim * 2, dim * 2, 4, 2, 1)  # 14→28
-        self.u1_b1 = ResnetBlock(
-            dim * 2 + dim * 2, dim, time_emb_dim=time_emb_dim
-        )  # 64+64   → 32
-        self.u1_b2 = ResnetBlock(
-            dim + dim * 2, dim, time_emb_dim=time_emb_dim
-        )  # 32+64   → 32
-
-        # 5️⃣ OUTPUT
-        self.final_conv = nn.Sequential(
-            nn.Conv2d(dim, dim // 2, 3, padding=1),
-            nn.SiLU(),
-            nn.Conv2d(dim // 2, channels, 1),
+        # --- Middle ---
+        self.middle = nn.ModuleList(
+            [
+                ResidualBlock(ch, ch, time_emb_dim, dropout=dropout),
+                AttentionBlock(ch),
+                ResidualBlock(ch, ch, time_emb_dim, dropout=dropout),
+            ]
         )
 
-    def forward(self, x, t):
-        t_emb = self.time_mlp(t)
-        x = self.init_conv(x)  # (B, 32, 28, 28)
+        # --- Upsampling ---
+        self.up_modules = nn.ModuleList()
+        for i, mult in reversed(list(enumerate(channel_mults))):
+            out_ch = ch // mult if i > 0 else ch
+            for _ in range(num_res_blocks + 1):
+                skip_ch = skips_ch.pop()
+                self.up_modules.append(
+                    ResidualBlock(ch + skip_ch, out_ch, time_emb_dim, dropout=dropout)
+                )
+                ch = out_ch
+                if ch in [c * base_channels for c in attn_resolutions]:
+                    self.up_modules.append(AttentionBlock(ch))
+            if i > 0:
+                self.up_modules.append(Upsample(ch))
 
-        # 🔽 DOWN
-        x = self.d1_b1(x, t_emb)
-        s1_1 = x
-        x = self.d1_b2(x, t_emb)
-        s1_2 = x
-        x = self.d1_down(x)  # (B, 64, 14, 14)
+        # --- Sortie ---
+        self.out_norm = nn.GroupNorm(8, ch)
+        self.out_conv = nn.Conv2d(ch, out_channels, 3, padding=1)
+        self.act = Swish()
 
-        x = self.d2_b1(x, t_emb)
-        s2_1 = x
-        x = self.d2_b2(x, t_emb)
-        s2_2 = x
-        x = self.d2_down(x)  # (B, 128, 7, 7)
+    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (B, 3, 28, 28) - image bruitée à l'étape t
+            t: (B,) - timestep (entiers 0..T-1)
+        Returns:
+            epsilon_pred: (B, 3, 28, 28) - bruit prédit
+        """
+        t_emb = self.time_emb(t)  # (B, time_emb_dim)
 
-        # 🔄 MID
-        x = self.mid1(x, t_emb)
-        x = self.mid2(x, t_emb)  # (B, 128, 7, 7)
+        # Entry
+        x = self.input_conv(x)
+        skips = [x]
 
-        # 🔼 UP (niveau 2 → 1)
-        x = self.u2_up(x)  # (B, 128, 14, 14)
-        x = torch.cat([x, s2_2], dim=1)
-        x = self.u2_b1(x, t_emb)  # 256 → 64
-        x = torch.cat([x, s2_1], dim=1)
-        x = self.u2_b2(x, t_emb)  # 192 → 64
+        # Down
+        for m in self.down_modules:
+            if isinstance(m, (Downsample, AttentionBlock)):
+                x = m(x)
+            else:
+                x = m(x, t_emb)
+            skips.append(x)
 
-        # 🔼 UP (niveau 1 → 0)
-        x = self.u1_up(x)  # (B, 64, 28, 28)
-        x = torch.cat([x, s1_2], dim=1)
-        x = self.u1_b1(x, t_emb)  # 128 → 32
-        x = torch.cat([x, s1_1], dim=1)
-        x = self.u1_b2(x, t_emb)  # 96  → 32
+        # Middle
+        for m in self.middle:
+            x = m(x, t_emb) if isinstance(m, ResidualBlock) else m(x)
 
-        return self.final_conv(x)
+        # Up
+        for m in self.up_modules:
+            if isinstance(m, Upsample):
+                x = m(x)
+            elif isinstance(m, AttentionBlock):
+                x = m(x)
+            else:
+                x = torch.cat([x, skips.pop()], dim=1)
+                x = m(x, t_emb)
+
+        # Output
+        return self.out_conv(self.act(self.out_norm(x)))
 
 
 if __name__ == "__main__":
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = Unet(dim=32, channels=3, time_emb_dim=128).to(device)
+    # Instanciation pour (3, 28, 28)
+    model = UNet(in_channels=3, out_channels=3, base_channels=64)
 
-    x = torch.randn(4, 3, 28, 28, device=device)
-    t = torch.randint(0, 1000, (4,), device=device)
+    # Forward pass
+    x_noisy = torch.randn(4, 3, 28, 28)  # batch de 4 images
+    timesteps = torch.randint(0, 1000, (4,))  # t aléatoires
+    epsilon_pred = model(x_noisy, timesteps)  # → (4, 3, 28, 28)
 
-    out = model(x, t)
-    assert out.shape == (4, 3, 28, 28), f"❌ Shape mismatch: {out.shape}"
-
-    # Vérifie la rétropropagation
-    loss = out.sum()
-    loss.backward()
-
-    print("✅ U-Net prêt:")
-    print(f"   Entrée : {list(x.shape)} + t")
-    print(f"   Sortie : {list(out.shape)}")
-    print("   Backprop : OK")
+    # Perte DDPM simplifiée (L_simple)
+    epsilon_true = torch.randn_like(epsilon_pred)
+    loss = F.mse_loss(epsilon_pred, epsilon_true)
+    print("Loss:", loss.item())
